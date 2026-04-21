@@ -5,11 +5,6 @@ __pycache__/
 *.pyd
 .Python
 
-# Django
-*.sqlite3
-media/
-staticfiles/
-
 # Environment
 env
 .env
@@ -22,9 +17,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-
-# Migrations
-tournaments/migrations/
 
 #AI
 .cursorignore
