@@ -1,8 +1,25 @@
-﻿import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import settings
+
+
+@dataclass
+class UsageSnapshot:
+    total_filament_mm: float
+    extruded_mass_g: float
+    retraction_count: int
+    retraction_loss_g: float
+    startup_loss_g: float
+    shutdown_loss_g: float
+    total_mass_g: float
+    progress_percent: float
+    estimated_print_time_seconds: float | None
+
+    @property
+    def inefficient_mass_g(self):
+        return self.retraction_loss_g + self.startup_loss_g + self.shutdown_loss_g
 
 
 def _parse_gcode_line(line):
@@ -18,44 +35,43 @@ def _parse_gcode_line(line):
         if len(part) < 2:
             continue
 
-        key = part[0].upper()
-        value = part[1:]
-        params[key] = value
+        params[part[0].upper()] = part[1:]
 
     return command, params
+
+
+def _extract_total_time_seconds(line):
+    if not line.startswith(";TIME:"):
+        return None
+
+    try:
+        return float(line.split(":", 1)[1].strip())
+    except ValueError:
+        return None
 
 
 def _calculate_mass_from_length(length_mm, diameter_mm, density_g_cm3):
     radius_mm = diameter_mm / 2
     filament_area_mm2 = math.pi * (radius_mm ** 2)
-
     volume_mm3 = filament_area_mm2 * length_mm
     volume_cm3 = volume_mm3 / settings.MM3_PER_CM3
     return volume_cm3 * density_g_cm3
 
 
-def calculate_filament_usage(
-    gcode_file_path,
-    filament_diameter_mm=None,
-    density_g_cm3=None,
-):
-    if filament_diameter_mm is None:
-        filament_diameter_mm = settings.PLA_FILAMENT_DIAMETER_MM
-
-    if density_g_cm3 is None:
-        density_g_cm3 = settings.PLA_DENSITY_G_CM3
-
-    total_filament_mm = 0.0
-    last_e = 0.0
-    max_e = 0.0
+def _collect_extrusion_events(gcode_file_path, filament_diameter_mm):
     extrusion_mode = "absolute"
     volumetric_extrusion = False
     volumetric_filament_diameter_mm = filament_diameter_mm
-    retraction_count = 0
+    max_e = 0.0
+    total_time_seconds = None
+    events = []
 
     with open(gcode_file_path, "r", encoding="utf-8", errors="ignore") as file:
-        for line in file:
-            command, params = _parse_gcode_line(line)
+        for raw_line in file:
+            if total_time_seconds is None:
+                total_time_seconds = _extract_total_time_seconds(raw_line.strip())
+
+            command, params = _parse_gcode_line(raw_line)
             if not command:
                 continue
 
@@ -88,10 +104,8 @@ def calculate_filament_usage(
 
             if command == "G92" and "E" in params:
                 try:
-                    last_e = float(params["E"])
-                    max_e = last_e
+                    max_e = float(params["E"])
                 except ValueError:
-                    last_e = 0.0
                     max_e = 0.0
                 continue
 
@@ -103,35 +117,143 @@ def calculate_filament_usage(
             except ValueError:
                 continue
 
-            if command == "G1" and current_e < 0:
-                retraction_count += 1
-
             if extrusion_mode == "relative":
-                delta_e = current_e if current_e > 0 else 0.0
-                last_e += current_e
+                delta_e = current_e
             else:
-                delta_e = current_e - max_e if current_e > max_e else 0.0
+                delta_e = current_e - max_e
                 if current_e > max_e:
                     max_e = current_e
-                last_e = current_e
 
-            if delta_e <= 0:
-                continue
+            if delta_e > 0:
+                if volumetric_extrusion:
+                    radius_mm = volumetric_filament_diameter_mm / 2
+                    filament_area_mm2 = math.pi * (radius_mm ** 2)
+                    extrusion_mm = delta_e / filament_area_mm2
+                else:
+                    extrusion_mm = delta_e
 
-            if volumetric_extrusion:
-                radius_mm = volumetric_filament_diameter_mm / 2
-                filament_area_mm2 = math.pi * (radius_mm ** 2)
-                total_filament_mm += delta_e / filament_area_mm2
-            else:
-                total_filament_mm += delta_e
+                events.append(("extrusion", extrusion_mm))
+            elif delta_e < 0:
+                events.append(("retraction", abs(delta_e)))
 
-    retraction_loss_g = retraction_count * settings.LOSS_PER_RETRACTION
-    total_mass_g = _calculate_mass_from_length(
-        total_filament_mm,
+    return events, total_time_seconds
+
+
+def _build_snapshot(
+    events,
+    target_extrusion_mm,
+    progress_percent,
+    filament_diameter_mm,
+    density_g_cm3,
+    total_time_seconds,
+):
+    consumed_filament_mm = 0.0
+    retraction_count = 0
+
+    for event_type, value_mm in events:
+        if event_type == "extrusion":
+            if consumed_filament_mm >= target_extrusion_mm:
+                break
+
+            remaining_mm = target_extrusion_mm - consumed_filament_mm
+            consumed_filament_mm += min(value_mm, remaining_mm)
+            continue
+
+        if consumed_filament_mm >= target_extrusion_mm:
+            break
+
+        retraction_count += 1
+
+    extruded_mass_g = _calculate_mass_from_length(
+        consumed_filament_mm,
         filament_diameter_mm,
         density_g_cm3,
-    ) + retraction_loss_g
-    return total_filament_mm, total_mass_g, retraction_count, retraction_loss_g
+    )
+    retraction_loss_g = retraction_count * settings.LOSS_PER_RETRACTION_G
+    startup_loss_g = settings.STARTUP_LOSS_G if consumed_filament_mm > 0 else 0.0
+    shutdown_loss_g = settings.SHUTDOWN_LOSS_G if consumed_filament_mm > 0 else 0.0
+    total_mass_g = extruded_mass_g + retraction_loss_g + startup_loss_g + shutdown_loss_g
+
+    estimated_time = None
+    if total_time_seconds is not None:
+        estimated_time = total_time_seconds * (progress_percent / 100.0)
+
+    return UsageSnapshot(
+        total_filament_mm=consumed_filament_mm,
+        extruded_mass_g=extruded_mass_g,
+        retraction_count=retraction_count,
+        retraction_loss_g=retraction_loss_g,
+        startup_loss_g=startup_loss_g,
+        shutdown_loss_g=shutdown_loss_g,
+        total_mass_g=total_mass_g,
+        progress_percent=progress_percent,
+        estimated_print_time_seconds=estimated_time,
+    )
+
+
+def calculate_usage_snapshot(
+    gcode_file_path,
+    progress_percent=100.0,
+    filament_diameter_mm=None,
+    density_g_cm3=None,
+):
+    if filament_diameter_mm is None:
+        filament_diameter_mm = settings.PLA_FILAMENT_DIAMETER_MM
+
+    if density_g_cm3 is None:
+        density_g_cm3 = settings.PLA_DENSITY_G_CM3
+
+    progress_percent = max(0.0, min(100.0, float(progress_percent)))
+
+    events, total_time_seconds = _collect_extrusion_events(
+        gcode_file_path,
+        filament_diameter_mm,
+    )
+
+    total_extrusion_mm = sum(value for event_type, value in events if event_type == "extrusion")
+    target_extrusion_mm = total_extrusion_mm * (progress_percent / 100.0)
+
+    return _build_snapshot(
+        events,
+        target_extrusion_mm,
+        progress_percent,
+        filament_diameter_mm,
+        density_g_cm3,
+        total_time_seconds,
+    )
+
+
+def calculate_filament_usage(
+    gcode_file_path,
+    filament_diameter_mm=None,
+    density_g_cm3=None,
+):
+    snapshot = calculate_usage_snapshot(
+        gcode_file_path,
+        progress_percent=100.0,
+        filament_diameter_mm=filament_diameter_mm,
+        density_g_cm3=density_g_cm3,
+    )
+    return (
+        snapshot.total_filament_mm,
+        snapshot.total_mass_g,
+        snapshot.retraction_count,
+        snapshot.retraction_loss_g,
+    )
+
+
+def calculate_failed_print_usage(
+    gcode_file_path,
+    failed_at_percent,
+    filament_diameter_mm=None,
+    density_g_cm3=None,
+):
+    return calculate_usage_snapshot(
+        gcode_file_path,
+        progress_percent=failed_at_percent,
+        filament_diameter_mm=filament_diameter_mm,
+        density_g_cm3=density_g_cm3,
+    )
 
 
 def calculate_extrusion(gcode_file_path):
@@ -149,112 +271,15 @@ def calculate_weight(length_mm, diameter_mm=None, density=None):
     return _calculate_mass_from_length(length_mm, diameter_mm, density)
 
 
-def _parse_length_value(value):
-    if isinstance(value, (int, float)):
-        return float(value)
+def format_duration(total_seconds):
+    if total_seconds is None:
+        return "Немає даних у G-code"
 
-    if isinstance(value, str):
-        stripped_value = value.strip().lower().replace(",", ".")
-        if stripped_value.endswith("mm"):
-            stripped_value = stripped_value[:-2].strip()
-            return float(stripped_value)
-        if stripped_value.endswith("m"):
-            stripped_value = stripped_value[:-1].strip()
-            return float(stripped_value) * 1000.0
-        return float(stripped_value)
-
-    raise ValueError("Unsupported length value")
+    seconds = int(round(total_seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def _parse_mass_value(value):
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    if isinstance(value, str):
-        stripped_value = value.strip().lower().replace(",", ".")
-        if stripped_value.endswith("kg"):
-            stripped_value = stripped_value[:-2].strip()
-            return float(stripped_value) * 1000.0
-        if stripped_value.endswith("g"):
-            stripped_value = stripped_value[:-1].strip()
-        return float(stripped_value)
-
-    raise ValueError("Unsupported mass value")
-
-
-def _load_expected_values(expected_file_path):
-    with open(expected_file_path, "r", encoding="utf-8-sig") as file:
-        data = json.load(file)
-
-    if not isinstance(data, dict):
-        raise ValueError("Expected JSON file must contain an object")
-
-    length_value = None
-    mass_value = None
-
-    for key in (
-        "filament_length_mm",
-        "length_mm",
-        "filament_used_mm",
-        "filament_length",
-    ):
-        if key in data:
-            length_value = _parse_length_value(data[key])
-            break
-
-    for key in (
-        "filament_mass_g",
-        "mass_g",
-        "weight_g",
-        "filament_weight_g",
-    ):
-        if key in data:
-            mass_value = _parse_mass_value(data[key])
-            break
-
-    if length_value is None and "filament_used" in data:
-        length_value = _parse_length_value(data["filament_used"])
-
-    if mass_value is None and "filament_used_weight" in data:
-        mass_value = _parse_mass_value(data["filament_used_weight"])
-
-    if length_value is None or mass_value is None:
-        raise ValueError("Expected JSON file must provide filament length and mass values")
-
-    return length_value, mass_value
-
-
-def _percent_difference(actual_value, expected_value):
-    if expected_value == 0:
-        return 0.0 if actual_value == 0 else float("inf")
-
-    return (actual_value - expected_value) / expected_value * 100.0
-
-
-def compare_result(gcode_file_path, expected_file_path=None, filament_diameter_mm=None):
-    actual_length_mm, actual_mass_g, retraction_count, retraction_loss_g = calculate_filament_usage(
-        gcode_file_path,
-        filament_diameter_mm=filament_diameter_mm,
-    )
-
-    if expected_file_path is None:
-        expected_file_path = str(Path(gcode_file_path).with_suffix(".json"))
-
-    expected_length_mm, expected_mass_g = _load_expected_values(expected_file_path)
-
-    return {
-        "actual": {
-            "length_mm": actual_length_mm,
-            "mass_g": actual_mass_g,
-            "retractions": retraction_count,
-            "retraction_loss_g": retraction_loss_g,
-        },
-        "expected": {
-            "length_mm": expected_length_mm,
-            "mass_g": expected_mass_g,
-        },
-        "percent": {
-            "length": _percent_difference(actual_length_mm, expected_length_mm),
-            "mass": _percent_difference(actual_mass_g, expected_mass_g),
-        },
-    }
+def default_gcode_dir():
+    return Path(settings.TEST_FOLDER)

@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+*.db
+*.db-journal
+database/app_settings.json
 
 # Environment
 env
